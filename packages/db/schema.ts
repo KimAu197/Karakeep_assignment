@@ -14,6 +14,7 @@ import {
 
 import type { ZApiKeyScope } from "@karakeep/shared/types/apiKeys";
 import { API_KEY_FULL_ACCESS_SCOPE } from "@karakeep/shared/types/apiKeys";
+import { BOOKMARK_HISTORY_FIELDS } from "@karakeep/shared/types/bookmarkHistory";
 import { BookmarkTypes } from "@karakeep/shared/types/bookmarks";
 import type { ZReaderViewReason } from "@karakeep/shared/types/bookmarks";
 
@@ -452,6 +453,37 @@ export const highlights = sqliteTable(
       tb.userId,
       tb.createdAt,
       tb.id,
+    ),
+  ],
+);
+
+// One row per changed field per user edit of a bookmark. All rows written by
+// the same save share a `changeId` and a `createdAt`.
+export const bookmarkHistory = sqliteTable(
+  "bookmarkHistory",
+  {
+    id: text("id")
+      .notNull()
+      .primaryKey()
+      .$defaultFn(() => createId()),
+    bookmarkId: text("bookmarkId")
+      .notNull()
+      .references(() => bookmarks.id, {
+        onDelete: "cascade",
+      }),
+    userId: text("userId")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    changeId: text("changeId").notNull(),
+    field: text("field", { enum: BOOKMARK_HISTORY_FIELDS }).notNull(),
+    oldValue: text("oldValue"),
+    newValue: text("newValue"),
+    createdAt: createdAtMsField(),
+  },
+  (tb) => [
+    index("bookmarkHistory_bookmarkId_createdAt_idx").on(
+      tb.bookmarkId,
+      tb.createdAt,
     ),
   ],
 );

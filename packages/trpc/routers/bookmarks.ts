@@ -1,11 +1,24 @@
+import { randomUUID } from "crypto";
 import { experimental_trpcMiddleware, TRPCError } from "@trpc/server";
-import { and, eq, gt, inArray, like, lt, or } from "drizzle-orm";
+import {
+  and,
+  desc,
+  eq,
+  gt,
+  inArray,
+  like,
+  lt,
+  notInArray,
+  or,
+  sql,
+} from "drizzle-orm";
 import { z } from "zod";
 
 import {
   assets,
   AssetTypes,
   bookmarkAssets,
+  bookmarkHistory,
   bookmarkLinks,
   bookmarks,
   bookmarkTags,
@@ -42,6 +55,7 @@ import { getRateLimitClient } from "@karakeep/shared/ratelimiting";
 import { FilterQuery, getSearchClient } from "@karakeep/shared/search";
 import { parseSearchQuery } from "@karakeep/shared/searchQueryParser";
 import { buildSummarizationInput } from "@karakeep/shared/summarization";
+import { zGetBookmarkHistoryResponseSchema } from "@karakeep/shared/types/bookmarkHistory";
 import type {
   ZBookmarkContent,
   ZBookmarkSource,
@@ -76,6 +90,10 @@ import {
   emitRateLimitedEvent,
   router,
 } from "../index";
+import {
+  diffBookmarkHistory,
+  PRIVATE_BOOKMARK_HISTORY_FIELDS,
+} from "../lib/bookmarkHistory";
 import { RuleEngine } from "../lib/ruleEngine";
 import { getBookmarkIdsFromMatcher } from "../lib/search";
 import { reciprocalRankFusion } from "../lib/searchRanking";
@@ -92,6 +110,8 @@ const HYBRID_CANDIDATES_PER_SOURCE = MAX_NUM_BOOKMARKS_PER_PAGE;
  * `(1 + cosine) / 2`), so this drops anything below ~0.2 cosine similarity.
  */
 const SEMANTIC_SCORE_THRESHOLD = 0.6;
+// `getBookmarkHistory` returns at most this many (newest) rows.
+const BOOKMARK_HISTORY_MAX_ROWS = 100;
 
 export const ensureBookmarkOwnership = experimental_trpcMiddleware<{
   ctx: AuthedContext;
@@ -586,6 +606,23 @@ export const bookmarksAppRouter = router({
       await ctx.db.transaction((tx) => {
         let somethingChanged = false;
 
+        // Read the stored values of the history-tracked fields before writing,
+        // inside the transaction, so the diff below sees what this save
+        // replaces.
+        const storedHistoryValues = tx
+          .select({
+            title: bookmarks.title,
+            note: bookmarks.note,
+            url: bookmarkLinks.url,
+            description: bookmarkLinks.description,
+            text: bookmarkTexts.text,
+          })
+          .from(bookmarks)
+          .leftJoin(bookmarkLinks, eq(bookmarkLinks.id, bookmarks.id))
+          .leftJoin(bookmarkTexts, eq(bookmarkTexts.id, bookmarks.id))
+          .where(eq(bookmarks.id, input.bookmarkId))
+          .get();
+
         // Update link-specific fields if any are provided
         const linkUpdateData: Partial<{
           url: string;
@@ -707,6 +744,32 @@ export const bookmarksAppRouter = router({
                 eq(bookmarks.userId, ctx.user.id),
                 eq(bookmarks.id, input.bookmarkId),
               ),
+            )
+            .run();
+        }
+
+        // Record one history row per tracked field this save really changes,
+        // diffing against the values written above (e.g. the trimmed url; a
+        // falsy text is not written).
+        const historyChanges = diffBookmarkHistory(storedHistoryValues ?? {}, {
+          title: commonUpdateData.title,
+          note: commonUpdateData.note,
+          url: linkUpdateData.url,
+          description: linkUpdateData.description,
+          text: input.text ? input.text : undefined,
+        });
+        if (historyChanges.length > 0) {
+          const changeId = randomUUID();
+          const createdAt = new Date();
+          tx.insert(bookmarkHistory)
+            .values(
+              historyChanges.map((change) => ({
+                ...change,
+                bookmarkId: input.bookmarkId,
+                userId: ctx.user.id,
+                changeId,
+                createdAt,
+              })),
             )
             .run();
         }
@@ -1026,6 +1089,38 @@ export const bookmarksAppRouter = router({
       return (
         await Bookmark.fromId(ctx, input.bookmarkId, input.includeContent)
       ).asZBookmark();
+    }),
+  getBookmarkHistory: bookmarksProcedure
+    .input(
+      z.object({
+        bookmarkId: z.string(),
+      }),
+    )
+    .output(zGetBookmarkHistoryResponseSchema)
+    .use(ensureBookmarkAccess)
+    .query(async ({ input, ctx }) => {
+      const isOwner = ctx.bookmark.userId === ctx.user.id;
+      const history = await ctx.db
+        .select()
+        .from(bookmarkHistory)
+        .where(
+          and(
+            eq(bookmarkHistory.bookmarkId, input.bookmarkId),
+            // Private fields (e.g. the owner's note) are only for the owner.
+            isOwner
+              ? undefined
+              : notInArray(
+                  bookmarkHistory.field,
+                  PRIVATE_BOOKMARK_HISTORY_FIELDS,
+                ),
+          ),
+        )
+        // Rows of one save share `createdAt`, and two saves can land in the
+        // same millisecond. SQLite gives a new row a rowid larger than every
+        // row already in the table, so rowid breaks those ties by save order.
+        .orderBy(desc(bookmarkHistory.createdAt), desc(sql`rowid`))
+        .limit(BOOKMARK_HISTORY_MAX_ROWS);
+      return { history };
     }),
   getBookmarkReadableContent: bookmarksProcedure
     .use(createBookmarksQueriedMiddleware())

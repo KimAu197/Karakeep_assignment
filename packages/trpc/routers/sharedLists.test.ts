@@ -1016,6 +1016,97 @@ describe("Shared Lists", () => {
       expect(ownerView.bookmarks).toHaveLength(2);
       expect(collabView.bookmarks).toHaveLength(2);
     });
+
+    test<CustomTestContext>("should hide the owner's note history from collaborators", async ({
+      apiCallers,
+    }) => {
+      const ownerApi = apiCallers[0];
+      const collaboratorApi = apiCallers[1];
+
+      const list = await ownerApi.lists.create({
+        name: "Shared List",
+        icon: "📚",
+        type: "manual",
+      });
+      const bookmark = await ownerApi.bookmarks.createBookmark({
+        type: BookmarkTypes.TEXT,
+        text: "Shared bookmark",
+      });
+      await ownerApi.bookmarks.updateBookmark({
+        bookmarkId: bookmark.id,
+        title: "Shared title",
+        note: "Private note",
+      });
+      await ownerApi.lists.addToList({
+        listId: list.id,
+        bookmarkId: bookmark.id,
+      });
+      await addAndAcceptCollaborator(
+        ownerApi,
+        collaboratorApi,
+        list.id,
+        "viewer",
+      );
+
+      const ownerView = await ownerApi.bookmarks.getBookmarkHistory({
+        bookmarkId: bookmark.id,
+      });
+      expect(ownerView.history.map((h) => h.field).sort()).toEqual([
+        "note",
+        "title",
+      ]);
+      expect(ownerView.history.find((h) => h.field === "note")).toMatchObject({
+        oldValue: null,
+        newValue: "Private note",
+      });
+
+      const collaboratorView =
+        await collaboratorApi.bookmarks.getBookmarkHistory({
+          bookmarkId: bookmark.id,
+        });
+      expect(
+        collaboratorView.history.map((h) => [h.field, h.oldValue, h.newValue]),
+      ).toEqual([["title", null, "Shared title"]]);
+    });
+
+    test<CustomTestContext>("should not let a collaborator create bookmark history", async ({
+      apiCallers,
+    }) => {
+      const ownerApi = apiCallers[0];
+      const collaboratorApi = apiCallers[1];
+
+      const list = await ownerApi.lists.create({
+        name: "Shared List",
+        icon: "📚",
+        type: "manual",
+      });
+      const bookmark = await ownerApi.bookmarks.createBookmark({
+        type: BookmarkTypes.TEXT,
+        text: "Shared bookmark",
+      });
+      await ownerApi.lists.addToList({
+        listId: list.id,
+        bookmarkId: bookmark.id,
+      });
+      await addAndAcceptCollaborator(
+        ownerApi,
+        collaboratorApi,
+        list.id,
+        "editor",
+      );
+
+      await expect(
+        collaboratorApi.bookmarks.updateBookmark({
+          bookmarkId: bookmark.id,
+          title: "Collaborator title",
+        }),
+      ).rejects.toThrow("User is not allowed to access resource");
+
+      const { history } = await ownerApi.bookmarks.getBookmarkHistory({
+        bookmarkId: bookmark.id,
+      });
+      expect(history).toEqual([]);
+    });
   });
 
   describe("Public Shared Lists", () => {

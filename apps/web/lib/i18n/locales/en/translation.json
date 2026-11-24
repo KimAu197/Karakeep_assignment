@@ -1481,6 +1481,22 @@
         "avatar": "Avatar",
         "unknown": "Attachment"
       }
+    },
+    "history": {
+      "title": "History",
+      "loading": "Loading history…",
+      "load_failed": "Couldn't load the history",
+      "none_yet": "No changes yet",
+      "empty_value": "empty",
+      "before": "Before",
+      "after": "After",
+      "fields": {
+        "title": "Title",
+        "url": "URL",
+        "description": "Description",
+        "text": "Text",
+        "note": "Note"
+      }
     }
   },
   "editor": {

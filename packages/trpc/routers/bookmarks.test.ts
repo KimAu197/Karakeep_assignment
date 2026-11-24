@@ -11,6 +11,7 @@ import {
 
 import {
   bookmarkAssets,
+  bookmarkHistory,
   bookmarkLinks,
   bookmarks,
   rssFeedImportsTable,
@@ -2069,6 +2070,282 @@ describe("Bookmark Routes", () => {
         url: "https://example.com/private",
       });
       expect(result.bookmarkId).toBeNull();
+    });
+  });
+
+  describe("Bookmark History", () => {
+    test<CustomTestContext>("records a title change with old value, new value, time and user", async ({
+      apiCallers,
+    }) => {
+      const api = apiCallers[0].bookmarks;
+      const owner = await apiCallers[0].users.whoami();
+      const bookmark = await api.createBookmark({
+        url: "https://example.com/a",
+        type: BookmarkTypes.LINK,
+        title: "Original",
+      });
+
+      const before = Date.now();
+      await api.updateBookmark({ bookmarkId: bookmark.id, title: "Edited" });
+
+      const { history } = await api.getBookmarkHistory({
+        bookmarkId: bookmark.id,
+      });
+      expect(history).toHaveLength(1);
+      expect(history[0]).toMatchObject({
+        bookmarkId: bookmark.id,
+        userId: owner.id,
+        field: "title",
+        oldValue: "Original",
+        newValue: "Edited",
+      });
+      expect(history[0].createdAt.getTime()).toBeGreaterThanOrEqual(before);
+    });
+
+    test<CustomTestContext>("records url and description changes of a link bookmark under one changeId", async ({
+      apiCallers,
+    }) => {
+      const api = apiCallers[0].bookmarks;
+      const bookmark = await api.createBookmark({
+        url: "https://example.com/a",
+        type: BookmarkTypes.LINK,
+      });
+
+      await api.updateBookmark({
+        bookmarkId: bookmark.id,
+        url: "https://example.com/b",
+        description: "A description",
+        note: "A note",
+      });
+
+      const { history } = await api.getBookmarkHistory({
+        bookmarkId: bookmark.id,
+      });
+      expect(history).toHaveLength(3);
+      expect(
+        history.map((h) => [h.field, h.oldValue, h.newValue]).sort(),
+      ).toEqual([
+        ["description", null, "A description"],
+        ["note", null, "A note"],
+        ["url", "https://example.com/a", "https://example.com/b"],
+      ]);
+      expect(new Set(history.map((h) => h.changeId)).size).toBe(1);
+      expect(new Set(history.map((h) => h.createdAt.getTime())).size).toBe(1);
+    });
+
+    test<CustomTestContext>("records a text change of a note bookmark", async ({
+      apiCallers,
+    }) => {
+      const api = apiCallers[0].bookmarks;
+      const bookmark = await api.createBookmark({
+        text: "Initial text",
+        type: BookmarkTypes.TEXT,
+      });
+
+      await api.updateBookmark({
+        bookmarkId: bookmark.id,
+        text: "Changed text",
+      });
+      // An empty text is not written by updateBookmark, so it is not recorded.
+      await api.updateBookmark({ bookmarkId: bookmark.id, text: "" });
+
+      const { history } = await api.getBookmarkHistory({
+        bookmarkId: bookmark.id,
+      });
+      expect(history.map((h) => [h.field, h.oldValue, h.newValue])).toEqual([
+        ["text", "Initial text", "Changed text"],
+      ]);
+    });
+
+    test<CustomTestContext>("records nothing for saves that change no tracked field", async ({
+      apiCallers,
+      db,
+    }) => {
+      const api = apiCallers[0].bookmarks;
+      const bookmark = await api.createBookmark({
+        url: "https://example.com/a",
+        type: BookmarkTypes.LINK,
+        title: "Same",
+      });
+
+      // A no-op save still bumps modifiedAt, as before history existed.
+      await db
+        .update(bookmarks)
+        .set({ modifiedAt: new Date(0) })
+        .where(eq(bookmarks.id, bookmark.id));
+
+      // Same value again.
+      await api.updateBookmark({ bookmarkId: bookmark.id, title: "Same" });
+      // No fields at all.
+      await api.updateBookmark({ bookmarkId: bookmark.id });
+      // "" over a stored null (description and note are null).
+      await api.updateBookmark({
+        bookmarkId: bookmark.id,
+        description: "",
+        note: "",
+      });
+      // null over a stored null.
+      await api.updateBookmark({ bookmarkId: bookmark.id, description: null });
+      // Only untracked fields.
+      await api.updateBookmark({
+        bookmarkId: bookmark.id,
+        archived: true,
+        favourited: true,
+        summary: "A summary",
+        author: "An author",
+        publisher: "A publisher",
+      });
+      // A falsy text is not written, so it is not recorded either.
+      await api.updateBookmark({ bookmarkId: bookmark.id, text: "" });
+
+      const { history } = await api.getBookmarkHistory({
+        bookmarkId: bookmark.id,
+      });
+      expect(history).toEqual([]);
+
+      const stored = await db.query.bookmarks.findFirst({
+        where: eq(bookmarks.id, bookmark.id),
+      });
+      expect(stored?.modifiedAt?.getTime()).toBeGreaterThan(0);
+    });
+
+    test<CustomTestContext>("records nothing for a url that only differs by surrounding whitespace", async ({
+      apiCallers,
+    }) => {
+      const api = apiCallers[0].bookmarks;
+      const bookmark = await api.createBookmark({
+        url: "https://example.com/a",
+        type: BookmarkTypes.LINK,
+      });
+
+      await api.updateBookmark({
+        bookmarkId: bookmark.id,
+        url: "https://example.com/a  ",
+      });
+
+      const { history } = await api.getBookmarkHistory({
+        bookmarkId: bookmark.id,
+      });
+      expect(history).toEqual([]);
+    });
+
+    test<CustomTestContext>("records nothing when the update fails", async ({
+      apiCallers,
+    }) => {
+      const api = apiCallers[0].bookmarks;
+      const bookmark = await api.createBookmark({
+        text: "Initial text",
+        type: BookmarkTypes.TEXT,
+      });
+
+      await expect(() =>
+        api.updateBookmark({
+          bookmarkId: bookmark.id,
+          title: "New title",
+          url: "https://should-fail.com",
+        }),
+      ).rejects.toThrow(
+        /Attempting to set link attributes for non-link type bookmark/,
+      );
+
+      const { history } = await api.getBookmarkHistory({
+        bookmarkId: bookmark.id,
+      });
+      expect(history).toEqual([]);
+    });
+
+    test<CustomTestContext>("returns history newest first, even for saves in the same millisecond", async ({
+      apiCallers,
+    }) => {
+      const api = apiCallers[0].bookmarks;
+      const bookmark = await api.createBookmark({
+        url: "https://example.com/a",
+        type: BookmarkTypes.LINK,
+        title: "A",
+      });
+
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+        await api.updateBookmark({ bookmarkId: bookmark.id, title: "B" });
+        await api.updateBookmark({
+          bookmarkId: bookmark.id,
+          title: "C",
+          note: "note 1",
+        });
+        await api.updateBookmark({ bookmarkId: bookmark.id, title: "D" });
+      } finally {
+        vi.useRealTimers();
+      }
+      await api.updateBookmark({ bookmarkId: bookmark.id, title: "E" });
+
+      const { history } = await api.getBookmarkHistory({
+        bookmarkId: bookmark.id,
+      });
+      expect(history.map((h) => [h.field, h.oldValue, h.newValue])).toEqual([
+        ["title", "D", "E"],
+        ["title", "C", "D"],
+        ["note", null, "note 1"],
+        ["title", "B", "C"],
+        ["title", "A", "B"],
+      ]);
+    });
+
+    test<CustomTestContext>("deleting a bookmark removes its history", async ({
+      apiCallers,
+      db,
+    }) => {
+      const api = apiCallers[0].bookmarks;
+      const bookmark = await api.createBookmark({
+        url: "https://example.com/a",
+        type: BookmarkTypes.LINK,
+      });
+      await api.updateBookmark({ bookmarkId: bookmark.id, title: "Edited" });
+      expect(
+        await db
+          .select()
+          .from(bookmarkHistory)
+          .where(eq(bookmarkHistory.bookmarkId, bookmark.id)),
+      ).toHaveLength(1);
+
+      await api.deleteBookmark({ bookmarkId: bookmark.id });
+
+      expect(
+        await db
+          .select()
+          .from(bookmarkHistory)
+          .where(eq(bookmarkHistory.bookmarkId, bookmark.id)),
+      ).toHaveLength(0);
+    });
+
+    test<CustomTestContext>("other users can neither read nor create a bookmark's history", async ({
+      apiCallers,
+    }) => {
+      const ownerApi = apiCallers[0].bookmarks;
+      const strangerApi = apiCallers[1].bookmarks;
+      const bookmark = await ownerApi.createBookmark({
+        url: "https://example.com/a",
+        type: BookmarkTypes.LINK,
+      });
+      await ownerApi.updateBookmark({ bookmarkId: bookmark.id, title: "T" });
+
+      await expect(() =>
+        strangerApi.getBookmarkHistory({ bookmarkId: bookmark.id }),
+      ).rejects.toMatchObject({
+        code: "NOT_FOUND",
+        message: "Bookmark not found",
+      });
+      await expect(() =>
+        strangerApi.updateBookmark({
+          bookmarkId: bookmark.id,
+          title: "Hijacked",
+        }),
+      ).rejects.toThrow(/Bookmark not found/);
+
+      const { history } = await ownerApi.getBookmarkHistory({
+        bookmarkId: bookmark.id,
+      });
+      expect(history.map((h) => h.newValue)).toEqual(["T"]);
     });
   });
 });

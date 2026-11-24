@@ -14,6 +14,7 @@ import {
 } from "drizzle-orm";
 import { z } from "zod";
 
+import type { KarakeepDBTransaction } from "@karakeep/db";
 import {
   assets,
   AssetTypes,
@@ -90,8 +91,13 @@ import {
   emitRateLimitedEvent,
   router,
 } from "../index";
+import type {
+  BookmarkHistoryChange,
+  BookmarkHistoryValues,
+} from "../lib/bookmarkHistory";
 import {
   diffBookmarkHistory,
+  mergeBookmarkHistoryChange,
   PRIVATE_BOOKMARK_HISTORY_FIELDS,
 } from "../lib/bookmarkHistory";
 import { RuleEngine } from "../lib/ruleEngine";
@@ -148,6 +154,106 @@ export const ensureBookmarkAccess = experimental_trpcMiddleware<{
     },
   });
 });
+
+/**
+ * Reads the stored values of the history-tracked fields of a bookmark. Call it
+ * in the transaction that writes the new values, before writing them.
+ */
+function readBookmarkHistoryValues(
+  tx: KarakeepDBTransaction,
+  bookmarkId: string,
+): BookmarkHistoryValues {
+  return (
+    tx
+      .select({
+        title: bookmarks.title,
+        note: bookmarks.note,
+        url: bookmarkLinks.url,
+        description: bookmarkLinks.description,
+        text: bookmarkTexts.text,
+      })
+      .from(bookmarks)
+      .leftJoin(bookmarkLinks, eq(bookmarkLinks.id, bookmarks.id))
+      .leftJoin(bookmarkTexts, eq(bookmarkTexts.id, bookmarks.id))
+      .where(eq(bookmarks.id, bookmarkId))
+      .get() ?? {}
+  );
+}
+
+/**
+ * Records the history of one save of a bookmark, in the transaction that
+ * writes it: one row per tracked field that really changes, sharing one
+ * `changeId` and `createdAt`. A change of an autosaved field may replace that
+ * field's latest row instead (see `mergeBookmarkHistoryChange`).
+ */
+function recordBookmarkHistory(
+  tx: KarakeepDBTransaction,
+  {
+    bookmarkId,
+    userId,
+    stored,
+    written,
+  }: {
+    bookmarkId: string;
+    userId: string;
+    stored: BookmarkHistoryValues;
+    written: BookmarkHistoryValues;
+  },
+) {
+  const changes = diffBookmarkHistory(stored, written);
+  if (changes.length === 0) {
+    return;
+  }
+  const changeId = randomUUID();
+  const createdAt = new Date();
+  const rows: BookmarkHistoryChange[] = [];
+  for (const change of changes) {
+    const previous = tx
+      .select({
+        id: bookmarkHistory.id,
+        userId: bookmarkHistory.userId,
+        oldValue: bookmarkHistory.oldValue,
+        createdAt: bookmarkHistory.createdAt,
+      })
+      .from(bookmarkHistory)
+      .where(
+        and(
+          eq(bookmarkHistory.bookmarkId, bookmarkId),
+          eq(bookmarkHistory.field, change.field),
+        ),
+      )
+      .orderBy(desc(bookmarkHistory.createdAt), desc(sql`rowid`))
+      .limit(1)
+      .get();
+    const merged = mergeBookmarkHistoryChange(
+      change,
+      previous,
+      userId,
+      createdAt,
+    );
+    if (merged.deleteRowId) {
+      tx.delete(bookmarkHistory)
+        .where(eq(bookmarkHistory.id, merged.deleteRowId))
+        .run();
+    }
+    if (merged.change) {
+      rows.push(merged.change);
+    }
+  }
+  if (rows.length > 0) {
+    tx.insert(bookmarkHistory)
+      .values(
+        rows.map((row) => ({
+          ...row,
+          bookmarkId,
+          userId,
+          changeId,
+          createdAt,
+        })),
+      )
+      .run();
+  }
+}
 
 async function attemptToDedupLink(ctx: AuthedContext, url: string) {
   const result = await ctx.db
@@ -319,15 +425,30 @@ export const bookmarksAppRouter = router({
             ...(input.note !== undefined ? { note: input.note } : {}),
             ...(input.summary !== undefined ? { summary: input.summary } : {}),
           };
-          await ctx.db
-            .update(bookmarks)
-            .set({ ...resaved, modifiedAt: now })
-            .where(
-              and(
-                eq(bookmarks.userId, ctx.user.id),
-                eq(bookmarks.id, alreadyExists.id),
-              ),
-            );
+          await ctx.db.transaction(
+            (tx) => {
+              const storedHistoryValues = readBookmarkHistoryValues(
+                tx,
+                alreadyExists.id,
+              );
+              tx.update(bookmarks)
+                .set({ ...resaved, modifiedAt: now })
+                .where(
+                  and(
+                    eq(bookmarks.userId, ctx.user.id),
+                    eq(bookmarks.id, alreadyExists.id),
+                  ),
+                )
+                .run();
+              recordBookmarkHistory(tx, {
+                bookmarkId: alreadyExists.id,
+                userId: ctx.user.id,
+                stored: storedHistoryValues,
+                written: { title: input.title, note: input.note },
+              });
+            },
+            { behavior: "immediate" },
+          );
           await Promise.all([
             triggerSearchReindex(alreadyExists.id, {
               groupId: ctx.user.id,
@@ -603,177 +724,161 @@ export const bookmarksAppRouter = router({
     .output(zBookmarkSchema)
     .use(ensureBookmarkOwnership)
     .mutation(async ({ input, ctx }) => {
-      await ctx.db.transaction((tx) => {
-        let somethingChanged = false;
+      await ctx.db.transaction(
+        (tx) => {
+          let somethingChanged = false;
 
-        // Read the stored values of the history-tracked fields before writing,
-        // inside the transaction, so the diff below sees what this save
-        // replaces.
-        const storedHistoryValues = tx
-          .select({
-            title: bookmarks.title,
-            note: bookmarks.note,
-            url: bookmarkLinks.url,
-            description: bookmarkLinks.description,
-            text: bookmarkTexts.text,
-          })
-          .from(bookmarks)
-          .leftJoin(bookmarkLinks, eq(bookmarkLinks.id, bookmarks.id))
-          .leftJoin(bookmarkTexts, eq(bookmarkTexts.id, bookmarks.id))
-          .where(eq(bookmarks.id, input.bookmarkId))
-          .get();
+          // Read the stored values of the history-tracked fields before writing,
+          // so the history recorded below sees what this save replaces.
+          const storedHistoryValues = readBookmarkHistoryValues(
+            tx,
+            input.bookmarkId,
+          );
 
-        // Update link-specific fields if any are provided
-        const linkUpdateData: Partial<{
-          url: string;
-          description: string | null;
-          author: string | null;
-          publisher: string | null;
-          datePublished: Date | null;
-          dateModified: Date | null;
-        }> = {};
-        if (input.url) {
-          linkUpdateData.url = input.url.trim();
-        }
-        if (input.description !== undefined) {
-          linkUpdateData.description = input.description;
-        }
-        if (input.author !== undefined) {
-          linkUpdateData.author = input.author;
-        }
-        if (input.publisher !== undefined) {
-          linkUpdateData.publisher = input.publisher;
-        }
-        if (input.datePublished !== undefined) {
-          linkUpdateData.datePublished = input.datePublished;
-        }
-        if (input.dateModified !== undefined) {
-          linkUpdateData.dateModified = input.dateModified;
-        }
-
-        if (Object.keys(linkUpdateData).length > 0) {
-          const result = tx
-            .update(bookmarkLinks)
-            .set(linkUpdateData)
-            .where(eq(bookmarkLinks.id, input.bookmarkId))
-            .run();
-          if (result.changes == 0) {
-            throw new TRPCError({
-              code: "BAD_REQUEST",
-              message:
-                "Attempting to set link attributes for non-link type bookmark",
-            });
+          // Update link-specific fields if any are provided
+          const linkUpdateData: Partial<{
+            url: string;
+            description: string | null;
+            author: string | null;
+            publisher: string | null;
+            datePublished: Date | null;
+            dateModified: Date | null;
+          }> = {};
+          if (input.url) {
+            linkUpdateData.url = input.url.trim();
           }
-          somethingChanged = true;
-        }
-
-        if (input.text) {
-          const result = tx
-            .update(bookmarkTexts)
-            .set({
-              text: input.text,
-            })
-            .where(eq(bookmarkTexts.id, input.bookmarkId))
-            .run();
-
-          if (result.changes == 0) {
-            throw new TRPCError({
-              code: "BAD_REQUEST",
-              message:
-                "Attempting to set link attributes for non-text type bookmark",
-            });
+          if (input.description !== undefined) {
+            linkUpdateData.description = input.description;
           }
-          somethingChanged = true;
-        }
-
-        if (input.assetContent !== undefined) {
-          const result = tx
-            .update(bookmarkAssets)
-            .set({
-              content: input.assetContent,
-            })
-            .where(and(eq(bookmarkAssets.id, input.bookmarkId)))
-            .run();
-
-          if (result.changes == 0) {
-            throw new TRPCError({
-              code: "BAD_REQUEST",
-              message:
-                "Attempting to set asset content for non-asset type bookmark",
-            });
+          if (input.author !== undefined) {
+            linkUpdateData.author = input.author;
           }
-          somethingChanged = true;
-        }
+          if (input.publisher !== undefined) {
+            linkUpdateData.publisher = input.publisher;
+          }
+          if (input.datePublished !== undefined) {
+            linkUpdateData.datePublished = input.datePublished;
+          }
+          if (input.dateModified !== undefined) {
+            linkUpdateData.dateModified = input.dateModified;
+          }
 
-        // Update common bookmark fields
-        const commonUpdateData: Partial<{
-          title: string | null;
-          archived: boolean;
-          favourited: boolean;
-          note: string | null;
-          summary: string | null;
-          createdAt: Date;
-          modifiedAt: Date; // Always update modifiedAt
-        }> = {
-          modifiedAt: new Date(),
-        };
-        if (input.title !== undefined) {
-          commonUpdateData.title = input.title;
-        }
-        if (input.archived !== undefined) {
-          commonUpdateData.archived = input.archived;
-        }
-        if (input.favourited !== undefined) {
-          commonUpdateData.favourited = input.favourited;
-        }
-        if (input.note !== undefined) {
-          commonUpdateData.note = input.note;
-        }
-        if (input.summary !== undefined) {
-          commonUpdateData.summary = input.summary;
-        }
-        if (input.createdAt !== undefined) {
-          commonUpdateData.createdAt = input.createdAt;
-        }
+          if (Object.keys(linkUpdateData).length > 0) {
+            const result = tx
+              .update(bookmarkLinks)
+              .set(linkUpdateData)
+              .where(eq(bookmarkLinks.id, input.bookmarkId))
+              .run();
+            if (result.changes == 0) {
+              throw new TRPCError({
+                code: "BAD_REQUEST",
+                message:
+                  "Attempting to set link attributes for non-link type bookmark",
+              });
+            }
+            somethingChanged = true;
+          }
 
-        if (Object.keys(commonUpdateData).length > 1 || somethingChanged) {
-          tx.update(bookmarks)
-            .set(commonUpdateData)
-            .where(
-              and(
-                eq(bookmarks.userId, ctx.user.id),
-                eq(bookmarks.id, input.bookmarkId),
-              ),
-            )
-            .run();
-        }
+          if (input.text) {
+            const result = tx
+              .update(bookmarkTexts)
+              .set({
+                text: input.text,
+              })
+              .where(eq(bookmarkTexts.id, input.bookmarkId))
+              .run();
 
-        // Record one history row per tracked field this save really changes,
-        // diffing against the values written above (e.g. the trimmed url; a
-        // falsy text is not written).
-        const historyChanges = diffBookmarkHistory(storedHistoryValues ?? {}, {
-          title: commonUpdateData.title,
-          note: commonUpdateData.note,
-          url: linkUpdateData.url,
-          description: linkUpdateData.description,
-          text: input.text ? input.text : undefined,
-        });
-        if (historyChanges.length > 0) {
-          const changeId = randomUUID();
-          const createdAt = new Date();
-          tx.insert(bookmarkHistory)
-            .values(
-              historyChanges.map((change) => ({
-                ...change,
-                bookmarkId: input.bookmarkId,
-                userId: ctx.user.id,
-                changeId,
-                createdAt,
-              })),
-            )
-            .run();
-        }
-      });
+            if (result.changes == 0) {
+              throw new TRPCError({
+                code: "BAD_REQUEST",
+                message:
+                  "Attempting to set link attributes for non-text type bookmark",
+              });
+            }
+            somethingChanged = true;
+          }
+
+          if (input.assetContent !== undefined) {
+            const result = tx
+              .update(bookmarkAssets)
+              .set({
+                content: input.assetContent,
+              })
+              .where(and(eq(bookmarkAssets.id, input.bookmarkId)))
+              .run();
+
+            if (result.changes == 0) {
+              throw new TRPCError({
+                code: "BAD_REQUEST",
+                message:
+                  "Attempting to set asset content for non-asset type bookmark",
+              });
+            }
+            somethingChanged = true;
+          }
+
+          // Update common bookmark fields
+          const commonUpdateData: Partial<{
+            title: string | null;
+            archived: boolean;
+            favourited: boolean;
+            note: string | null;
+            summary: string | null;
+            createdAt: Date;
+            modifiedAt: Date; // Always update modifiedAt
+          }> = {
+            modifiedAt: new Date(),
+          };
+          if (input.title !== undefined) {
+            commonUpdateData.title = input.title;
+          }
+          if (input.archived !== undefined) {
+            commonUpdateData.archived = input.archived;
+          }
+          if (input.favourited !== undefined) {
+            commonUpdateData.favourited = input.favourited;
+          }
+          if (input.note !== undefined) {
+            commonUpdateData.note = input.note;
+          }
+          if (input.summary !== undefined) {
+            commonUpdateData.summary = input.summary;
+          }
+          if (input.createdAt !== undefined) {
+            commonUpdateData.createdAt = input.createdAt;
+          }
+
+          if (Object.keys(commonUpdateData).length > 1 || somethingChanged) {
+            tx.update(bookmarks)
+              .set(commonUpdateData)
+              .where(
+                and(
+                  eq(bookmarks.userId, ctx.user.id),
+                  eq(bookmarks.id, input.bookmarkId),
+                ),
+              )
+              .run();
+          }
+
+          // Record history against the values written above (e.g. the trimmed
+          // url; a falsy text is not written).
+          recordBookmarkHistory(tx, {
+            bookmarkId: input.bookmarkId,
+            userId: ctx.user.id,
+            stored: storedHistoryValues,
+            written: {
+              title: commonUpdateData.title,
+              note: commonUpdateData.note,
+              url: linkUpdateData.url,
+              description: linkUpdateData.description,
+              text: input.text ? input.text : undefined,
+            },
+          });
+        },
+        // It reads before it writes: take the write lock up front so a
+        // concurrent writer makes it wait instead of fail.
+        { behavior: "immediate" },
+      );
 
       // Refetch the updated bookmark data to return the full object
       const updatedBookmark = (

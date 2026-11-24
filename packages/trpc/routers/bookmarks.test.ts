@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   afterEach,
   assert,
@@ -2168,16 +2168,30 @@ describe("Bookmark Routes", () => {
         title: "Same",
       });
 
-      // A no-op save still bumps modifiedAt, as before history existed.
-      await db
-        .update(bookmarks)
-        .set({ modifiedAt: new Date(0) })
-        .where(eq(bookmarks.id, bookmark.id));
+      const resetModifiedAt = () =>
+        db
+          .update(bookmarks)
+          .set({ modifiedAt: new Date(0) })
+          .where(eq(bookmarks.id, bookmark.id));
+      const storedModifiedAt = async () =>
+        (
+          await db.query.bookmarks.findFirst({
+            where: eq(bookmarks.id, bookmark.id),
+          })
+        )?.modifiedAt?.getTime();
 
-      // Same value again.
+      // Same value again. As before history existed, this save still bumps
+      // modifiedAt even though it records nothing.
+      await resetModifiedAt();
       await api.updateBookmark({ bookmarkId: bookmark.id, title: "Same" });
-      // No fields at all.
+      expect(await storedModifiedAt()).toBeGreaterThan(0);
+
+      // No fields at all. As before history existed, this save writes nothing,
+      // so modifiedAt is not bumped either.
+      await resetModifiedAt();
       await api.updateBookmark({ bookmarkId: bookmark.id });
+      expect(await storedModifiedAt()).toBe(0);
+
       // "" over a stored null (description and note are null).
       await api.updateBookmark({
         bookmarkId: bookmark.id,
@@ -2202,11 +2216,6 @@ describe("Bookmark Routes", () => {
         bookmarkId: bookmark.id,
       });
       expect(history).toEqual([]);
-
-      const stored = await db.query.bookmarks.findFirst({
-        where: eq(bookmarks.id, bookmark.id),
-      });
-      expect(stored?.modifiedAt?.getTime()).toBeGreaterThan(0);
     });
 
     test<CustomTestContext>("records nothing for a url that only differs by surrounding whitespace", async ({
@@ -2346,6 +2355,472 @@ describe("Bookmark Routes", () => {
         bookmarkId: bookmark.id,
       });
       expect(history.map((h) => h.newValue)).toEqual(["T"]);
+    });
+
+    describe("autosave merge", () => {
+      const T0 = new Date("2026-01-01T00:00:00.000Z").getTime();
+      const MINUTE = 60 * 1000;
+      const setNow = (msAfterT0: number) =>
+        vi.setSystemTime(new Date(T0 + msAfterT0));
+
+      beforeEach(() => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+      });
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      async function historyOf(api: APICallerType, bookmarkId: string) {
+        const { history } = await api.bookmarks.getBookmarkHistory({
+          bookmarkId,
+        });
+        return history;
+      }
+
+      test<CustomTestContext>("merges note saves within the window into one row, and starts a new row after it", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        setNow(0);
+        const bookmark = await api.createBookmark({
+          url: "https://example.com/a",
+          type: BookmarkTypes.LINK,
+        });
+
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "a" });
+        setNow(1 * MINUTE);
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "ab" });
+        setNow(2 * MINUTE);
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "abc" });
+
+        let history = await historyOf(apiCallers[0], bookmark.id);
+        expect(history).toHaveLength(1);
+        expect(history[0]).toMatchObject({
+          field: "note",
+          oldValue: null,
+          newValue: "abc",
+          createdAt: new Date(T0 + 2 * MINUTE),
+        });
+
+        // Exactly 5 minutes after the last row: outside the window.
+        setNow(7 * MINUTE);
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "abcd" });
+
+        history = await historyOf(apiCallers[0], bookmark.id);
+        expect(history.map((h) => [h.oldValue, h.newValue])).toEqual([
+          ["abc", "abcd"],
+          [null, "abc"],
+        ]);
+      });
+
+      test<CustomTestContext>("the merged row takes the changeId of the latest save", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        setNow(0);
+        const bookmark = await api.createBookmark({
+          url: "https://example.com/a",
+          type: BookmarkTypes.LINK,
+        });
+
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "a" });
+        setNow(1 * MINUTE);
+        await api.updateBookmark({
+          bookmarkId: bookmark.id,
+          note: "ab",
+          title: "T",
+        });
+
+        const history = await historyOf(apiCallers[0], bookmark.id);
+        expect(history.map((h) => [h.field, h.oldValue, h.newValue])).toEqual(
+          expect.arrayContaining([
+            ["note", null, "ab"],
+            ["title", null, "T"],
+          ]),
+        );
+        expect(history).toHaveLength(2);
+        expect(new Set(history.map((h) => h.changeId)).size).toBe(1);
+        expect(new Set(history.map((h) => h.createdAt.getTime()))).toEqual(
+          new Set([T0 + 1 * MINUTE]),
+        );
+      });
+
+      test<CustomTestContext>("a reverted note deletes the merged row but keeps other rows of that save", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        setNow(0);
+        const bookmark = await api.createBookmark({
+          url: "https://example.com/a",
+          type: BookmarkTypes.LINK,
+        });
+
+        await api.updateBookmark({
+          bookmarkId: bookmark.id,
+          title: "T",
+          note: "draft",
+        });
+        setNow(30 * 1000);
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "" });
+
+        const history = await historyOf(apiCallers[0], bookmark.id);
+        expect(history.map((h) => [h.field, h.oldValue, h.newValue])).toEqual([
+          ["title", null, "T"],
+        ]);
+      });
+
+      test<CustomTestContext>("merges only with the latest note row", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        setNow(0);
+        const bookmark = await api.createBookmark({
+          url: "https://example.com/a",
+          type: BookmarkTypes.LINK,
+        });
+
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "a" });
+        setNow(6 * MINUTE);
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "b" });
+        setNow(7 * MINUTE);
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "c" });
+
+        const history = await historyOf(apiCallers[0], bookmark.id);
+        expect(history.map((h) => [h.oldValue, h.newValue])).toEqual([
+          ["a", "c"],
+          [null, "a"],
+        ]);
+      });
+
+      test<CustomTestContext>("does not merge with a note row written by another user", async ({
+        apiCallers,
+        db,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        const otherUser = await apiCallers[1].users.whoami();
+        setNow(0);
+        const bookmark = await api.createBookmark({
+          url: "https://example.com/a",
+          type: BookmarkTypes.LINK,
+        });
+        // Only the owner can edit a bookmark today, so a row by another user
+        // can only be set up directly.
+        await db.insert(bookmarkHistory).values({
+          bookmarkId: bookmark.id,
+          userId: otherUser.id,
+          changeId: "other-change",
+          field: "note",
+          oldValue: null,
+          newValue: "theirs",
+          createdAt: new Date(T0),
+        });
+
+        setNow(1 * MINUTE);
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "mine" });
+
+        const history = await historyOf(apiCallers[0], bookmark.id);
+        expect(history.map((h) => [h.oldValue, h.newValue])).toEqual([
+          [null, "mine"],
+          [null, "theirs"],
+        ]);
+      });
+
+      test<CustomTestContext>("never merges fields that are not autosaved", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        setNow(0);
+        const bookmark = await api.createBookmark({
+          url: "https://example.com/a",
+          type: BookmarkTypes.LINK,
+        });
+
+        await api.updateBookmark({
+          bookmarkId: bookmark.id,
+          title: "A",
+          description: "d1",
+        });
+        setNow(5 * 1000);
+        await api.updateBookmark({
+          bookmarkId: bookmark.id,
+          title: "B",
+          description: "d2",
+          url: "https://example.com/b",
+        });
+        setNow(10 * 1000);
+        await api.updateBookmark({ bookmarkId: bookmark.id, title: "A" });
+
+        const history = await historyOf(apiCallers[0], bookmark.id);
+        expect(
+          history
+            .filter((h) => h.field === "title")
+            .map((h) => [h.oldValue, h.newValue]),
+        ).toEqual([
+          ["B", "A"],
+          ["A", "B"],
+          [null, "A"],
+        ]);
+        expect(history.filter((h) => h.field === "description")).toHaveLength(
+          2,
+        );
+        expect(history.filter((h) => h.field === "url")).toHaveLength(1);
+      });
+
+      test<CustomTestContext>("never merges text edits of a note bookmark", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        setNow(0);
+        const bookmark = await api.createBookmark({
+          text: "v1",
+          type: BookmarkTypes.TEXT,
+        });
+
+        await api.updateBookmark({ bookmarkId: bookmark.id, text: "v2" });
+        setNow(5 * 1000);
+        await api.updateBookmark({ bookmarkId: bookmark.id, text: "v3" });
+
+        const history = await historyOf(apiCallers[0], bookmark.id);
+        expect(history.map((h) => [h.oldValue, h.newValue])).toEqual([
+          ["v2", "v3"],
+          ["v1", "v2"],
+        ]);
+      });
+
+      test<CustomTestContext>("merges only with a note row of the same bookmark", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        setNow(0);
+        const bookmarkA = await api.createBookmark({
+          url: "https://example.com/a",
+          type: BookmarkTypes.LINK,
+          note: "A0",
+        });
+        const bookmarkB = await api.createBookmark({
+          url: "https://example.com/b",
+          type: BookmarkTypes.LINK,
+          note: "B0",
+        });
+
+        await api.updateBookmark({ bookmarkId: bookmarkA.id, note: "A1" });
+        const [rowA] = await historyOf(apiCallers[0], bookmarkA.id);
+
+        // Within the window, but on another bookmark.
+        setNow(1 * MINUTE);
+        await api.updateBookmark({ bookmarkId: bookmarkB.id, note: "B1" });
+
+        expect(await historyOf(apiCallers[0], bookmarkA.id)).toEqual([rowA]);
+        expect(rowA).toMatchObject({
+          field: "note",
+          oldValue: "A0",
+          newValue: "A1",
+        });
+        const historyB = await historyOf(apiCallers[0], bookmarkB.id);
+        expect(historyB.map((h) => [h.field, h.oldValue, h.newValue])).toEqual([
+          ["note", "B0", "B1"],
+        ]);
+      });
+
+      test<CustomTestContext>("merges note rows across a newer row of another field", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        setNow(0);
+        const bookmark = await api.createBookmark({
+          url: "https://example.com/a",
+          type: BookmarkTypes.LINK,
+          title: "T0",
+        });
+
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "n1" });
+        setNow(1 * MINUTE);
+        await api.updateBookmark({ bookmarkId: bookmark.id, title: "T1" });
+        const titleRow = (await historyOf(apiCallers[0], bookmark.id)).find(
+          (h) => h.field === "title",
+        );
+        assert(titleRow);
+
+        setNow(2 * MINUTE);
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "n2" });
+
+        const history = await historyOf(apiCallers[0], bookmark.id);
+        expect(history).toHaveLength(2);
+        expect(history[0]).toMatchObject({
+          field: "note",
+          oldValue: null,
+          newValue: "n2",
+          createdAt: new Date(T0 + 2 * MINUTE),
+        });
+        expect(history[1]).toEqual(titleRow);
+        expect(titleRow).toMatchObject({ oldValue: "T0", newValue: "T1" });
+      });
+
+      test<CustomTestContext>("one save that reverts the note and changes the title keeps only the new title row", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        setNow(0);
+        const bookmark = await api.createBookmark({
+          url: "https://example.com/a",
+          type: BookmarkTypes.LINK,
+          title: "T0",
+        });
+
+        await api.updateBookmark({ bookmarkId: bookmark.id, note: "draft" });
+        setNow(1 * MINUTE);
+        await api.updateBookmark({
+          bookmarkId: bookmark.id,
+          note: "",
+          title: "T1",
+        });
+
+        const history = await historyOf(apiCallers[0], bookmark.id);
+        expect(history).toHaveLength(1);
+        expect(history[0]).toMatchObject({
+          field: "title",
+          oldValue: "T0",
+          newValue: "T1",
+          createdAt: new Date(T0 + 1 * MINUTE),
+        });
+      });
+    });
+
+    describe("re-save of an existing link", () => {
+      const URL = "https://example.com/resave-history";
+
+      async function historyOf(api: APICallerType, bookmarkId: string) {
+        const { history } = await api.bookmarks.getBookmarkHistory({
+          bookmarkId,
+        });
+        return history.map((h) => [h.field, h.oldValue, h.newValue]);
+      }
+
+      test<CustomTestContext>("records a changed title", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        const original = await api.createBookmark({
+          url: URL,
+          type: BookmarkTypes.LINK,
+          title: "Original",
+        });
+
+        const resaved = await api.createBookmark({
+          url: URL,
+          type: BookmarkTypes.LINK,
+          title: "Renamed",
+        });
+        expect(resaved).toMatchObject({
+          id: original.id,
+          alreadyExists: true,
+          title: "Renamed",
+        });
+
+        expect(await historyOf(apiCallers[0], original.id)).toEqual([
+          ["title", "Original", "Renamed"],
+        ]);
+      });
+
+      test<CustomTestContext>("records nothing for the same title or no title", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        const original = await api.createBookmark({
+          url: URL,
+          type: BookmarkTypes.LINK,
+          title: "Original",
+          note: "Note",
+        });
+
+        await api.createBookmark({
+          url: URL,
+          type: BookmarkTypes.LINK,
+          title: "Original",
+          note: "Note",
+        });
+        await api.createBookmark({ url: URL, type: BookmarkTypes.LINK });
+
+        expect(await historyOf(apiCallers[0], original.id)).toEqual([]);
+        expect(
+          await api.getBookmark({ bookmarkId: original.id }),
+        ).toMatchObject({ title: "Original", note: "Note" });
+      });
+
+      test<CustomTestContext>("records a changed note, merged with a recent note edit", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        const original = await api.createBookmark({
+          url: URL,
+          type: BookmarkTypes.LINK,
+        });
+
+        await api.createBookmark({
+          url: URL,
+          type: BookmarkTypes.LINK,
+          note: "First",
+        });
+        expect(await historyOf(apiCallers[0], original.id)).toEqual([
+          ["note", null, "First"],
+        ]);
+
+        await api.updateBookmark({ bookmarkId: original.id, note: "Second" });
+        expect(await historyOf(apiCallers[0], original.id)).toEqual([
+          ["note", null, "Second"],
+        ]);
+      });
+
+      test<CustomTestContext>("records nothing for an exempt source", async ({
+        apiCallers,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        const original = await api.createBookmark({
+          url: URL,
+          type: BookmarkTypes.LINK,
+          title: "Original",
+        });
+
+        const resaved = await api.createBookmark({
+          url: URL,
+          type: BookmarkTypes.LINK,
+          title: "From the feed",
+          source: "rss",
+        });
+        expect(resaved).toMatchObject({ id: original.id, title: "Original" });
+
+        expect(await historyOf(apiCallers[0], original.id)).toEqual([]);
+      });
+
+      test<CustomTestContext>("does not change the bookmark when recording its history fails", async ({
+        apiCallers,
+        db,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        const original = await api.createBookmark({
+          url: URL,
+          type: BookmarkTypes.LINK,
+          title: "Original",
+        });
+        await api.updateBookmark({ bookmarkId: original.id, archived: true });
+
+        // Make the history insert fail: the read, the update and the insert
+        // share one transaction, so the update must be rolled back too.
+        db.run(sql`DROP TABLE bookmarkHistory`);
+
+        await expect(() =>
+          api.createBookmark({
+            url: URL,
+            type: BookmarkTypes.LINK,
+            title: "Renamed",
+          }),
+        ).rejects.toThrow(/no such table: bookmarkHistory/);
+
+        const stored = await db.query.bookmarks.findFirst({
+          where: eq(bookmarks.id, original.id),
+        });
+        expect(stored).toMatchObject({ title: "Original", archived: true });
+      });
     });
   });
 });

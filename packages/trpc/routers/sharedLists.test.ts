@@ -1069,6 +1069,61 @@ describe("Shared Lists", () => {
       ).toEqual([["title", null, "Shared title"]]);
     });
 
+    test<CustomTestContext>("should hide merged note history from collaborators", async ({
+      apiCallers,
+    }) => {
+      const ownerApi = apiCallers[0];
+      const collaboratorApi = apiCallers[1];
+
+      const list = await ownerApi.lists.create({
+        name: "Shared List",
+        icon: "📚",
+        type: "manual",
+      });
+      const bookmark = await ownerApi.bookmarks.createBookmark({
+        type: BookmarkTypes.TEXT,
+        text: "Shared bookmark",
+      });
+      // Autosaved note edits in quick succession are merged into one row.
+      await ownerApi.bookmarks.updateBookmark({
+        bookmarkId: bookmark.id,
+        note: "Private",
+      });
+      await ownerApi.bookmarks.updateBookmark({
+        bookmarkId: bookmark.id,
+        title: "Shared title",
+        note: "Private note",
+      });
+      await ownerApi.lists.addToList({
+        listId: list.id,
+        bookmarkId: bookmark.id,
+      });
+      await addAndAcceptCollaborator(
+        ownerApi,
+        collaboratorApi,
+        list.id,
+        "viewer",
+      );
+
+      const ownerView = await ownerApi.bookmarks.getBookmarkHistory({
+        bookmarkId: bookmark.id,
+      });
+      expect(
+        ownerView.history.map((h) => [h.field, h.oldValue, h.newValue]).sort(),
+      ).toEqual([
+        ["note", null, "Private note"],
+        ["title", null, "Shared title"],
+      ]);
+
+      const collaboratorView =
+        await collaboratorApi.bookmarks.getBookmarkHistory({
+          bookmarkId: bookmark.id,
+        });
+      expect(
+        collaboratorView.history.map((h) => [h.field, h.oldValue, h.newValue]),
+      ).toEqual([["title", null, "Shared title"]]);
+    });
+
     test<CustomTestContext>("should not let a collaborator create bookmark history", async ({
       apiCallers,
     }) => {

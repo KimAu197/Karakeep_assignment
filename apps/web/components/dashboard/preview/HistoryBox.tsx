@@ -107,7 +107,7 @@ function HistoryEntry({ change }: { change: HistoryChange }) {
 export default function HistoryBox({ bookmarkId }: { bookmarkId: string }) {
   const api = useTRPC();
   const { t } = useTranslation();
-  const [isOpen, setIsOpen] = useState(false);
+  const [isOpen, setIsOpen] = useState(true);
 
   const { data, isPending, isError } = useQuery(
     api.bookmarks.getBookmarkHistory.queryOptions({ bookmarkId }),

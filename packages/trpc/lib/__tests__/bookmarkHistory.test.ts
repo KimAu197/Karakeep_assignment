@@ -2,9 +2,12 @@ import { describe, expect, test } from "vitest";
 
 import { BOOKMARK_HISTORY_FIELDS } from "@karakeep/shared/types/bookmarkHistory";
 
+import type { BookmarkHistoryChange } from "../bookmarkHistory";
 import {
   BOOKMARK_HISTORY_FIELD_REGISTRY,
+  BOOKMARK_HISTORY_MERGE_WINDOW_MS,
   diffBookmarkHistory,
+  mergeBookmarkHistoryChange,
   PRIVATE_BOOKMARK_HISTORY_FIELDS,
 } from "../bookmarkHistory";
 
@@ -14,6 +17,14 @@ describe("bookmark history registry", () => {
       [...BOOKMARK_HISTORY_FIELDS].sort(),
     );
     expect(PRIVATE_BOOKMARK_HISTORY_FIELDS).toEqual(["note"]);
+  });
+
+  test("marks only note as autosaved", () => {
+    expect(
+      BOOKMARK_HISTORY_FIELDS.filter(
+        (field) => BOOKMARK_HISTORY_FIELD_REGISTRY[field].autosaved,
+      ),
+    ).toEqual(["note"]);
   });
 });
 
@@ -84,5 +95,91 @@ describe("diffBookmarkHistory", () => {
     expect(diffBookmarkHistory({ title: "a" }, { title: "a " })).toEqual([
       { field: "title", oldValue: "a", newValue: "a " },
     ]);
+  });
+});
+
+describe("mergeBookmarkHistoryChange", () => {
+  const now = new Date("2026-01-01T00:10:00.000Z");
+  const noteChange: BookmarkHistoryChange = {
+    field: "note",
+    oldValue: "ab",
+    newValue: "abc",
+  };
+  const previousRow = (msBeforeNow: number, userId = "user-1") => ({
+    id: "previous-row",
+    userId,
+    oldValue: "a",
+    createdAt: new Date(now.getTime() - msBeforeNow),
+  });
+
+  test("merges an autosaved field with its recent row by the same user", () => {
+    expect(
+      mergeBookmarkHistoryChange(noteChange, previousRow(1000), "user-1", now),
+    ).toEqual({
+      deleteRowId: "previous-row",
+      change: { field: "note", oldValue: "a", newValue: "abc" },
+    });
+    expect(
+      mergeBookmarkHistoryChange(
+        noteChange,
+        previousRow(BOOKMARK_HISTORY_MERGE_WINDOW_MS - 1),
+        "user-1",
+        now,
+      ).deleteRowId,
+    ).toBe("previous-row");
+  });
+
+  test("does not merge a row at or beyond the window", () => {
+    for (const age of [
+      BOOKMARK_HISTORY_MERGE_WINDOW_MS,
+      BOOKMARK_HISTORY_MERGE_WINDOW_MS + 1,
+    ]) {
+      expect(
+        mergeBookmarkHistoryChange(noteChange, previousRow(age), "user-1", now),
+      ).toEqual({ deleteRowId: null, change: noteChange });
+    }
+  });
+
+  test("does not merge without a previous row or with another user's row", () => {
+    expect(
+      mergeBookmarkHistoryChange(noteChange, undefined, "user-1", now),
+    ).toEqual({ deleteRowId: null, change: noteChange });
+    expect(
+      mergeBookmarkHistoryChange(
+        noteChange,
+        previousRow(1000, "user-2"),
+        "user-1",
+        now,
+      ),
+    ).toEqual({ deleteRowId: null, change: noteChange });
+  });
+
+  test("never merges fields that are not autosaved", () => {
+    for (const field of ["title", "url", "description", "text"] as const) {
+      const change = { field, oldValue: "ab", newValue: "abc" };
+      expect(
+        mergeBookmarkHistoryChange(change, previousRow(1000), "user-1", now),
+      ).toEqual({ deleteRowId: null, change });
+    }
+  });
+
+  test("deletes the previous row and writes nothing when the edit is reverted", () => {
+    expect(
+      mergeBookmarkHistoryChange(
+        { field: "note", oldValue: "ab", newValue: "a" },
+        previousRow(1000),
+        "user-1",
+        now,
+      ),
+    ).toEqual({ deleteRowId: "previous-row", change: null });
+    // Empty values are equal under the empty-value rule.
+    expect(
+      mergeBookmarkHistoryChange(
+        { field: "note", oldValue: "draft", newValue: null },
+        { ...previousRow(1000), oldValue: "" },
+        "user-1",
+        now,
+      ),
+    ).toEqual({ deleteRowId: "previous-row", change: null });
   });
 });

@@ -48,6 +48,7 @@ import {
 import { getBookmarkTitle } from "@karakeep/shared/utils/bookmarkUtils";
 
 import { BookmarkTagsEditor } from "./BookmarkTagsEditor";
+import { withTitleOnlyIfChanged } from "./editBookmarkPayload";
 
 const formSchema = zUpdateBookmarksRequestSchema.extend({
   createdAt: z.date().optional(),
@@ -142,11 +143,13 @@ export function EditBookmarkDialog({
     });
 
   function onSubmit(values: BookmarkFormValues) {
-    // Ensure optional fields that are empty strings are sent as null/undefined if appropriate
-    const payload = {
-      ...values,
-      title: values.title ?? null,
-    };
+    // Dirtiness is measured against the values the form was last reset with
+    // (when the dialog opens and after a save), not against later tag updates.
+    // getFieldState reads the live state; `form.formState` can be a stale render.
+    const payload = withTitleOnlyIfChanged(
+      values,
+      form.getFieldState("title").isDirty,
+    );
     updateBookmarkMutate(payload);
   }
 

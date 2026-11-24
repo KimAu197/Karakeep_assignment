@@ -1,12 +1,20 @@
 /**
- * The dialog pre-fills the title with a fallback (e.g. the crawled title) when
- * no title is stored, so sending it unchanged would store that fallback. The
- * title is therefore only sent when the user changed the field.
+ * The title and the note are only sent when the user changed them in the
+ * dialog. The title is pre-filled with a fallback (e.g. the crawled title)
+ * when none is stored, so sending it unchanged would store that fallback. The
+ * note can be saved from the preview sidebar while the dialog holds an older
+ * copy, so sending it unchanged could overwrite the newer note.
  */
-export function withTitleOnlyIfChanged<T extends { title?: string | null }>(
+export function withTitleAndNoteOnlyIfChanged<
+  T extends { title?: string | null; note?: string },
+>(
   values: T,
-  titleChanged: boolean,
-): Omit<T, "title"> & { title?: string | null } {
-  const { title, ...rest } = values;
-  return titleChanged ? { ...rest, title: title ?? null } : rest;
+  changed: { title: boolean; note: boolean },
+): Omit<T, "title" | "note"> & { title?: string | null; note?: string } {
+  const { title, note, ...rest } = values;
+  return {
+    ...rest,
+    ...(changed.title ? { title: title ?? null } : {}),
+    ...(changed.note ? { note } : {}),
+  };
 }

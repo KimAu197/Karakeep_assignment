@@ -4,55 +4,102 @@ import { act, renderHook } from "@testing-library/react";
 import { useForm } from "react-hook-form";
 import { describe, expect, it } from "vitest";
 
-import { withTitleOnlyIfChanged } from "./editBookmarkPayload";
+import { withTitleAndNoteOnlyIfChanged } from "./editBookmarkPayload";
 
 const values = {
   bookmarkId: "b1",
   title: "Crawled title",
-  note: "a note",
+  note: "A",
+  summary: "a summary",
 };
+const unchanged = { title: false, note: false };
 
-describe("withTitleOnlyIfChanged", () => {
-  it("leaves out an untouched title", () => {
-    const payload = withTitleOnlyIfChanged(values, false);
+describe("withTitleAndNoteOnlyIfChanged", () => {
+  it("leaves out an untouched title and note, and keeps the other fields", () => {
+    const payload = withTitleAndNoteOnlyIfChanged(values, unchanged);
     expect(payload).not.toHaveProperty("title");
-    expect(payload).toEqual({ bookmarkId: "b1", note: "a note" });
+    expect(payload).not.toHaveProperty("note");
+    expect(payload).toEqual({ bookmarkId: "b1", summary: "a summary" });
   });
 
   it("sends a changed title", () => {
     expect(
-      withTitleOnlyIfChanged({ ...values, title: "Renamed" }, true),
-    ).toEqual({ ...values, title: "Renamed" });
+      withTitleAndNoteOnlyIfChanged(
+        { ...values, title: "Renamed" },
+        { ...unchanged, title: true },
+      ),
+    ).toEqual({ bookmarkId: "b1", summary: "a summary", title: "Renamed" });
   });
 
   it("sends a cleared title as it does today", () => {
-    expect(withTitleOnlyIfChanged({ ...values, title: "" }, true)).toEqual({
-      ...values,
-      title: "",
-    });
+    const titleChanged = { ...unchanged, title: true };
     expect(
-      withTitleOnlyIfChanged({ ...values, title: undefined }, true),
-    ).toEqual({ ...values, title: null });
+      withTitleAndNoteOnlyIfChanged({ ...values, title: "" }, titleChanged),
+    ).toMatchObject({ title: "" });
+    expect(
+      withTitleAndNoteOnlyIfChanged(
+        { ...values, title: undefined },
+        titleChanged,
+      ),
+    ).toMatchObject({ title: null });
+  });
+
+  it("sends a changed note", () => {
+    expect(
+      withTitleAndNoteOnlyIfChanged(
+        { ...values, note: "B" },
+        { ...unchanged, note: true },
+      ),
+    ).toEqual({ bookmarkId: "b1", summary: "a summary", note: "B" });
+  });
+
+  it("sends a cleared note as the empty string, which clears it today", () => {
+    expect(
+      withTitleAndNoteOnlyIfChanged(
+        { ...values, note: "" },
+        { ...unchanged, note: true },
+      ),
+    ).toEqual({ bookmarkId: "b1", summary: "a summary", note: "" });
+  });
+
+  it("treats the title and the note independently", () => {
+    const titleOnly = withTitleAndNoteOnlyIfChanged(
+      { ...values, title: "Renamed" },
+      { title: true, note: false },
+    );
+    expect(titleOnly).toMatchObject({ title: "Renamed" });
+    expect(titleOnly).not.toHaveProperty("note");
+
+    const noteOnly = withTitleAndNoteOnlyIfChanged(
+      { ...values, note: "B" },
+      { title: false, note: true },
+    );
+    expect(noteOnly).toMatchObject({ note: "B" });
+    expect(noteOnly).not.toHaveProperty("title");
   });
 });
 
-// The dialog asks react-hook-form whether the title is dirty. These pin down
-// that this is tracked for a field edited the way the dialog's input edits it
+// The dialog asks react-hook-form whether a field is dirty. These pin down
+// that this is tracked for a field edited the way the dialog's inputs edit it
 // (the registered onChange), and that it is relative to the last reset.
-describe("react-hook-form title dirtiness", () => {
-  function setup() {
+describe.each([
+  { field: "title" as const, initial: "Crawled title" },
+  { field: "note" as const, initial: "A" },
+])("react-hook-form $field dirtiness", ({ field, initial }) => {
+  function setup(defaults: { title?: string | null; note?: string } = {}) {
     const form = renderHook(() =>
-      useForm<{ title?: string | null }>({
-        defaultValues: { title: "Crawled title" },
+      useForm<{ title?: string | null; note?: string }>({
+        defaultValues: { title: "Crawled title", note: "A", ...defaults },
       }),
     ).result;
-    const type = (value: string) =>
+    const type = (name: "title" | "note", value: string) =>
       act(() =>
         form.current
-          .register("title")
-          .onChange({ target: { name: "title", value }, type: "change" }),
+          .register(name)
+          .onChange({ target: { name, value }, type: "change" }),
       );
-    const isDirty = () => form.current.getFieldState("title").isDirty;
+    const isDirty = (name: "title" | "note" = field) =>
+      form.current.getFieldState(name).isDirty;
     return { form, type, isDirty };
   }
 
@@ -63,26 +110,39 @@ describe("react-hook-form title dirtiness", () => {
 
   it("is dirty after a change, including clearing it", async () => {
     const { type, isDirty } = setup();
-    await type("Renamed");
+    await type(field, "Changed");
     expect(isDirty()).toBe(true);
-    await type("");
+    await type(field, "");
     expect(isDirty()).toBe(true);
   });
 
   it("is not dirty after changing it back", async () => {
     const { type, isDirty } = setup();
-    await type("x");
+    await type(field, "x");
     expect(isDirty()).toBe(true);
-    await type("Crawled title");
+    await type(field, initial);
     expect(isDirty()).toBe(false);
   });
 
   it("is measured against the values of the last reset", async () => {
     const { form, type, isDirty } = setup();
-    await type("Renamed");
-    act(() => form.current.reset({ title: "Renamed" }));
+    await type(field, "Changed");
+    act(() => form.current.reset({ title: "Changed", note: "Changed" }));
     expect(isDirty()).toBe(false);
-    await type("Again");
+    await type(field, "Again");
     expect(isDirty()).toBe(true);
+  });
+
+  it("is not made dirty by editing the other field", async () => {
+    const { type, isDirty } = setup();
+    await type(field === "title" ? "note" : "title", "Changed");
+    expect(isDirty(field === "title" ? "note" : "title")).toBe(true);
+    expect(isDirty()).toBe(false);
+  });
+
+  it("is not dirty when untouched and no value is stored", () => {
+    // The dialog's note default is undefined when the stored note is null.
+    const { isDirty } = setup({ [field]: undefined });
+    expect(isDirty()).toBe(false);
   });
 });

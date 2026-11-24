@@ -25,7 +25,7 @@ import { InferenceClientFactory } from "@karakeep/shared/inference";
 import { BookmarkTypes } from "@karakeep/shared/types/bookmarks";
 
 import { WebhooksService } from "../models/webhooks.service";
-import type { APICallerType, CustomTestContext } from "../testUtils";
+import type { APICallerType, CustomTestContext, TestDB } from "../testUtils";
 import {
   defaultBeforeEach,
   getApiKeyCallerForPlainKey,
@@ -2820,6 +2820,127 @@ describe("Bookmark Routes", () => {
           where: eq(bookmarks.id, original.id),
         });
         expect(stored).toMatchObject({ title: "Original", archived: true });
+      });
+    });
+
+    describe("bookmark deleted before the write", () => {
+      // Simulates another request deleting the bookmark after the
+      // existence/ownership check but before the capture transaction starts.
+      function deleteBookmarkBeforeNextTransaction(
+        db: TestDB,
+        bookmarkId: string,
+      ) {
+        const realTransaction = db.transaction.bind(db);
+        vi.spyOn(db, "transaction").mockImplementationOnce(
+          (transaction, config) => {
+            db.delete(bookmarks).where(eq(bookmarks.id, bookmarkId)).run();
+            return realTransaction(transaction, config);
+          },
+        );
+      }
+
+      test<CustomTestContext>("a re-save still resolves as before the feature and records nothing", async ({
+        apiCallers,
+        db,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        const original = await api.createBookmark({
+          url: "https://example.com/vanished",
+          type: BookmarkTypes.LINK,
+          title: "Original",
+        });
+        const triggerSearchReindexMock =
+          getTestQueueMocks().triggerSearchReindex;
+        triggerSearchReindexMock.mockClear();
+
+        deleteBookmarkBeforeNextTransaction(db, original.id);
+        const resaved = await api.createBookmark({
+          url: "https://example.com/vanished",
+          type: BookmarkTypes.LINK,
+          title: "Renamed",
+          note: "A note",
+        });
+
+        // The update matched no row; the response is built from the values
+        // read before, as it was before history existed.
+        expect(resaved).toMatchObject({
+          id: original.id,
+          alreadyExists: true,
+          archived: false,
+          title: "Renamed",
+          note: "A note",
+        });
+        expect(triggerSearchReindexMock).toHaveBeenCalledWith(original.id, {
+          groupId: (await apiCallers[0].users.whoami()).id,
+        });
+        expect(
+          await db
+            .select()
+            .from(bookmarks)
+            .where(eq(bookmarks.id, original.id)),
+        ).toEqual([]);
+        expect(await db.select().from(bookmarkHistory)).toEqual([]);
+      });
+
+      test<CustomTestContext>("an update fails with NOT_FOUND as before the feature and records nothing", async ({
+        apiCallers,
+        db,
+      }) => {
+        const api = apiCallers[0].bookmarks;
+        const bookmark = await api.createBookmark({
+          url: "https://example.com/vanished",
+          type: BookmarkTypes.LINK,
+          title: "Original",
+        });
+
+        deleteBookmarkBeforeNextTransaction(db, bookmark.id);
+        // The update matches no row, then the refetch of the bookmark fails.
+        await expect(
+          api.updateBookmark({
+            bookmarkId: bookmark.id,
+            title: "Renamed",
+            note: "A note",
+          }),
+        ).rejects.toMatchObject({
+          code: "NOT_FOUND",
+          message: "Bookmark not found",
+        });
+        expect(await db.select().from(bookmarkHistory)).toEqual([]);
+      });
+
+      test<CustomTestContext>("a bookmark without link or text content still records title and note", async ({
+        apiCallers,
+        db,
+      }) => {
+        // Asset bookmarks in `createBookmark` require a pre-uploaded asset, so
+        // this inserts one directly, like the summarizeBookmark tests do.
+        const userId = (await apiCallers[0].users.whoami()).id;
+        const [created] = await db
+          .insert(bookmarks)
+          .values({ userId, type: BookmarkTypes.ASSET })
+          .returning();
+        await db.insert(bookmarkAssets).values({
+          id: created.id,
+          assetId: "test-asset-id",
+          assetType: "pdf",
+          fileName: "paper.pdf",
+        });
+
+        await apiCallers[0].bookmarks.updateBookmark({
+          bookmarkId: created.id,
+          title: "Asset title",
+          note: "Asset note",
+        });
+
+        const { history } = await apiCallers[0].bookmarks.getBookmarkHistory({
+          bookmarkId: created.id,
+        });
+        expect(
+          history.map((h) => [h.field, h.oldValue, h.newValue]).sort(),
+        ).toEqual([
+          ["note", null, "Asset note"],
+          ["title", null, "Asset title"],
+        ]);
       });
     });
   });

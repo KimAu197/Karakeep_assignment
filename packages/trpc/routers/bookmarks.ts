@@ -158,26 +158,25 @@ export const ensureBookmarkAccess = experimental_trpcMiddleware<{
 /**
  * Reads the stored values of the history-tracked fields of a bookmark. Call it
  * in the transaction that writes the new values, before writing them.
+ * Returns `undefined` when the bookmark row no longer exists.
  */
 function readBookmarkHistoryValues(
   tx: KarakeepDBTransaction,
   bookmarkId: string,
-): BookmarkHistoryValues {
-  return (
-    tx
-      .select({
-        title: bookmarks.title,
-        note: bookmarks.note,
-        url: bookmarkLinks.url,
-        description: bookmarkLinks.description,
-        text: bookmarkTexts.text,
-      })
-      .from(bookmarks)
-      .leftJoin(bookmarkLinks, eq(bookmarkLinks.id, bookmarks.id))
-      .leftJoin(bookmarkTexts, eq(bookmarkTexts.id, bookmarks.id))
-      .where(eq(bookmarks.id, bookmarkId))
-      .get() ?? {}
-  );
+): BookmarkHistoryValues | undefined {
+  return tx
+    .select({
+      title: bookmarks.title,
+      note: bookmarks.note,
+      url: bookmarkLinks.url,
+      description: bookmarkLinks.description,
+      text: bookmarkTexts.text,
+    })
+    .from(bookmarks)
+    .leftJoin(bookmarkLinks, eq(bookmarkLinks.id, bookmarks.id))
+    .leftJoin(bookmarkTexts, eq(bookmarkTexts.id, bookmarks.id))
+    .where(eq(bookmarks.id, bookmarkId))
+    .get();
 }
 
 /**
@@ -196,10 +195,15 @@ function recordBookmarkHistory(
   }: {
     bookmarkId: string;
     userId: string;
-    stored: BookmarkHistoryValues;
+    stored: BookmarkHistoryValues | undefined;
     written: BookmarkHistoryValues;
   },
 ) {
+  // The bookmark was deleted after the caller checked it: the save updates no
+  // row, so there is no history to record (and no row to reference).
+  if (!stored) {
+    return;
+  }
   const changes = diffBookmarkHistory(stored, written);
   if (changes.length === 0) {
     return;

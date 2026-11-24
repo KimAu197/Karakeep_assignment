@@ -1,0 +1,60 @@
+=== @karakeep/trpc ===
+[33mThe plugin "vite-tsconfig-paths" is detected. Vite now supports tsconfig paths resolution natively via the [1mresolve.tsconfigPaths[22m option. You can remove the plugin and set [1mresolve.tsconfigPaths: true[22m in your Vite config instead.[39m
+ RUN  v4.1.11 /Users/kenzieluo/Desktop/code/karakeep/packages/trpc
+Warning: A vi.mock("@karakeep/shared-server") call in "/Users/kenzieluo/Desktop/code/karakeep/packages/trpc/testUtils.ts" is not at the top level of the module. Although it appears nested, it will be hoisted and executed before any tests run. Move it to the top level to reflect its actual execution order. This will become an error in a future version.
+See: https://vitest.dev/guide/mocking/modules#how-it-works
+ Test Files  26 passed (26)
+      Tests  561 passed (561)
+   Start at  13:55:03
+   Duration  7.16s (transform 4.58s, setup 0ms, import 25.98s, tests 38.74s, environment 2ms)
+exit: 0
+=== @karakeep/shared ===
+[33mThe plugin "vite-tsconfig-paths" is detected. Vite now supports tsconfig paths resolution natively via the [1mresolve.tsconfigPaths[22m option. You can remove the plugin and set [1mresolve.tsconfigPaths: true[22m in your Vite config instead.[39m
+ RUN  v4.1.11 /Users/kenzieluo/Desktop/code/karakeep/packages/shared
+ Test Files  13 passed (13)
+      Tests  170 passed (170)
+   Start at  13:55:11
+   Duration  2.80s (transform 785ms, setup 0ms, import 1.51s, tests 2.63s, environment 1ms)
+exit: 0
+=== @karakeep/api ===
+ RUN  v4.1.11 /Users/kenzieluo/Desktop/code/karakeep/packages/api
+ Test Files  3 passed (3)
+      Tests  11 passed (11)
+   Start at  13:55:14
+   Duration  206ms (transform 75ms, setup 0ms, import 164ms, tests 55ms, environment 0ms)
+exit: 0
+=== @karakeep/web ===
+    198|     for (const headers of requests) {
+    199|       expect((await call("/sign-in/email", { body, headers })).status)…
+       |                                                                        ^
+    200|         200,
+    201|       );
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+ FAIL  lib/date-format.test.ts > formatLocalDate > formats supported locales with localized date and time
+AssertionError: expected 'Jan 5, 2025, 10:42 AM' to be 'Jan 5, 2025, 3:42 PM' // Object.is equality
+Expected: "Jan 5, 2025, 3:42 PM"
+Received: "Jan 5, 2025, 10:42 AM"
+ ❯ lib/date-format.test.ts:16:50
+     14|
+     15|   it("formats supported locales with localized date and time", () => {
+     16|     expect(formatLocalDate(date, "PP, p", "en")).toBe("Jan 5, 2025, 3:…
+       |                                                  ^
+     17|     expect(formatLocalDate(date, "PPP", "fr")).toBe("5 janvier 2025");
+     18|   });
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+ Test Files  2 failed | 8 passed (10)
+      Tests  2 failed | 101 passed (103)
+   Start at  13:55:16
+   Duration  8.42s (transform 415ms, setup 0ms, import 1.32s, tests 8.02s, environment 2.32s)
+undefined
+/Users/kenzieluo/Desktop/code/karakeep/apps/web:
+[ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL] Command failed with exit code 1: vitest run
+exit: 1
+=== @karakeep/shared-server ===
+[33mThe plugin "vite-tsconfig-paths" is detected. Vite now supports tsconfig paths resolution natively via the [1mresolve.tsconfigPaths[22m option. You can remove the plugin and set [1mresolve.tsconfigPaths: true[22m in your Vite config instead.[39m
+ RUN  v4.1.11 /Users/kenzieluo/Desktop/code/karakeep/packages/shared-server
+ Test Files  2 passed (2)
+      Tests  10 passed (10)
+   Start at  13:55:25
+   Duration  233ms (transform 81ms, setup 0ms, import 172ms, tests 9ms, environment 0ms)
+exit: 0
